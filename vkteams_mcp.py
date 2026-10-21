@@ -21,6 +21,14 @@ import time
 from datetime import datetime, timezone
 
 import httpx
+
+try:
+    from mcp.server.mcpserver.exceptions import ToolError  # mcp 2.x
+except ImportError:
+    try:
+        from mcp.server.fastmcp.exceptions import ToolError  # mcp 1.x
+    except ImportError:
+        ToolError = RuntimeError
 try:
     from mcp.server.mcpserver import MCPServer as FastMCP  # mcp 2.x
 except ImportError:
@@ -33,6 +41,8 @@ API_VER = os.environ.get("VKTEAMS_API_VER", "v150")
 BEARER = os.environ.get("VKTEAMS_BEARER", "")
 
 RAPI_BASE = f"{U_DOMAIN}/api/{API_VER}/rapi/"
+# URL fetchEvents сессии: из DevTools, всё до "?" (напр. .../api/v150/bos/<server>/aim/fetchEvents)
+FETCH_URL = os.environ.get("VKTEAMS_FETCH_URL", "")
 
 _req_counter = itertools.count(1)
 mcp = FastMCP("vkteams")
@@ -52,7 +62,7 @@ def _headers() -> dict:
 
 def _check_env() -> None:
     if not AIMSID or not SN:
-        raise RuntimeError("Не заданы VKTEAMS_AIMSID и/или VKTEAMS_SN")
+        raise ToolError("Не заданы VKTEAMS_AIMSID и/или VKTEAMS_SN")
 
 
 async def _rapi(method: str, params: dict) -> dict:
@@ -64,11 +74,12 @@ async def _rapi(method: str, params: dict) -> dict:
     }
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.post(RAPI_BASE + method, json=body, headers=_headers())
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise ToolError(f"rapi/{method}: HTTP {r.status_code}: {r.text[:300]}")
     data = r.json()
     code = (data.get("status") or {}).get("code")
     if code != 20000:
-        raise RuntimeError(f"rapi/{method}: status {code}: {data.get('status')}")
+        raise ToolError(f"rapi/{method}: status {code}: {data.get('status')}")
     return data.get("results") or {}
 
 
@@ -124,6 +135,60 @@ async def send_message(target: str, text: str) -> dict:
     Отправляет от имени владельца аккаунта — вызывать только по явной просьбе пользователя."""
     params = {"target": target, "parts": {"mainPart": {"text": {"plain": text}}}}
     return await _rapi("message/send", params)
+
+
+async def _fetch_events(timeout_ms: int = 1) -> list[dict]:
+    _check_env()
+    if not FETCH_URL:
+        raise ToolError("Не задан VKTEAMS_FETCH_URL (URL запроса fetchEvents из DevTools, без query)")
+    params = {"aimsid": AIMSID, "first": 1, "timeout": timeout_ms, "rnd": f"{time.time():.6f}"}
+    h = {k: v for k, v in _headers().items() if k != "content-type"}
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(FETCH_URL, params=params, headers=h)
+    if r.status_code != 200:
+        raise ToolError(f"fetchEvents: HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    resp = data.get("response", data)
+    if resp.get("statusCode") not in (None, 200):
+        raise ToolError(f"fetchEvents: {resp.get('statusCode')} {resp.get('statusText')}")
+    return (resp.get("data") or {}).get("events") or []
+
+
+@mcp.tool()
+async def list_chats(query: str = "", limit: int = 100) -> dict:
+    """Список чатов и контактов (из событий buddylist / histDlgState в fetchEvents).
+    query — фильтр по названию или sn (без учёта регистра)."""
+    events = await _fetch_events()
+    chats: dict[str, dict] = {}
+    for e in events:
+        t, d = e.get("type"), e.get("eventData") or {}
+        if t == "buddylist":
+            for g in d.get("groups", []):
+                for b in g.get("buddies", []):
+                    sn = b.get("aimId") or b.get("sn")
+                    if sn:
+                        chats.setdefault(sn, {}).update({
+                            "sn": sn, "name": b.get("friendly") or b.get("displayId") or sn,
+                            "group": g.get("name"),
+                            "type": "chat" if sn.endswith("@chat.agent") else "person"})
+        elif t == "histDlgState":
+            sn = d.get("sn")
+            if sn:
+                c = chats.setdefault(sn, {"sn": sn, "name": sn,
+                                          "type": "chat" if sn.endswith("@chat.agent") else "person"})
+                c["unread"] = d.get("unreadCnt")
+                pers = {p.get("sn"): p.get("friendly") for p in d.get("persons", [])}
+                if pers.get(sn):
+                    c["name"] = pers[sn]
+    if not chats:
+        from collections import Counter
+        return {"chats": [], "note": "в ответе нет buddylist/histDlgState",
+                "event_types": dict(Counter(e.get("type") for e in events))}
+    items = list(chats.values())
+    if query:
+        q = query.lower()
+        items = [c for c in items if q in (c.get("name") or "").lower() or q in c["sn"].lower()]
+    return {"total": len(items), "chats": items[:limit]}
 
 
 if __name__ == "__main__":

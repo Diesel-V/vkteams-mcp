@@ -12,6 +12,7 @@ MCP-сервер для [VK Teams](https://teams.vk.com), работающий *
 |---|---|
 | `get_history` | История чата или лички, с пагинацией и тредами; имена авторов подставляются из ответа |
 | `send_message` | Отправка сообщения в личку или групповой чат |
+| `list_chats` | Список чатов и контактов с фильтром по названию (нужен `VKTEAMS_FETCH_URL`) |
 | `rapi_call` | Произвольный метод `rapi/*` — для всего, что ещё не обёрнуто |
 
 Проверено на облачном VK Teams (`myteam.mail.ru` / VK WorkSpace), API `v150`.
@@ -23,7 +24,7 @@ MCP-сервер для [VK Teams](https://teams.vk.com), работающий *
 ```bash
 git clone https://github.com/Diesel-V/vkteams-mcp.git ~/mcp/vkteams-mcp
 cd ~/mcp/vkteams-mcp
-./setup.sh 'ТВОЙ_AIMSID' 'login@company.ru'
+./setup.sh 'ТВОЙ_AIMSID' 'login@company.ru' 'FETCH_URL'
 ```
 
 Скрипт создаёт venv, ставит зависимости, добавляет сервер `vkteams` в `claude_desktop_config.json` (старый конфиг сохраняется в `.bak`) и перезапускает Claude Desktop. Только macOS; на других ОС пропиши конфиг вручную (ниже).
@@ -59,6 +60,7 @@ aimsid действует до перелогина. После выхода и�
 | `VKTEAMS_SN` | да | — |
 | `VKTEAMS_U_DOMAIN` | нет | `https://u.myteam.vmailru.net` |
 | `VKTEAMS_API_VER` | нет | `v150` |
+| `VKTEAMS_FETCH_URL` | для `list_chats` | URL запроса `fetchEvents` из DevTools без query, вида `https://u.myteam.vmailru.net/api/v150/bos/<server>/aim/fetchEvents` |
 
 Для on-premise инсталляции подставь свой `VKTEAMS_U_DOMAIN` (виден в DevTools как хост rapi-запросов).
 
@@ -68,6 +70,7 @@ aimsid действует до перелогина. После выхода и�
 - Успех — `status.code == 20000` (не HTTP-код).
 - `getHistory` требует `patchVersion` (для первого запроса — `"init"`).
 - Отправка — `rapi/message/send` с `{"target": ..., "parts": {"mainPart": {"text": {"plain": ...}}}}`.
+- Список чатов приходит событием `buddylist` в `GET .../bos/<server>/aim/fetchEvents?aimsid=...&first=1`.
 - Bearer-токен из веб-клиента не нужен, хватает aimsid.
 
 ## Безопасность
