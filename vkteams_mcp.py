@@ -44,6 +44,28 @@ RAPI_BASE = f"{U_DOMAIN}/api/{API_VER}/rapi/"
 # URL fetchEvents сессии: из DevTools, всё до "?" (напр. .../api/v150/bos/<server>/aim/fetchEvents)
 FETCH_URL = os.environ.get("VKTEAMS_FETCH_URL", "")
 
+# Сессия из файла (перечитывается при каждом вызове, перезапуск не нужен).
+# Пишется после входа во встроенном браузере Claude: {"aimsid": "...", "fetch_url": "..."}
+SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vkteams_session.json")
+
+
+def _load_session() -> None:
+    global AIMSID, FETCH_URL
+    try:
+        import json
+        with open(SESSION_FILE) as f:
+            d = json.load(f)
+        AIMSID = d.get("aimsid") or AIMSID
+        FETCH_URL = (d.get("fetch_url") or FETCH_URL).split("?")[0]
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        raise ToolError(f"Не читается {SESSION_FILE}: {e}")
+
+
+EXPIRED_HINT = ("Сессия VK Teams протухла. Войди в VK Teams во встроенном браузере Claude "
+                "(myteam.mail.ru) и попроси Claude обновить сессию — перезапуск не нужен.")
+
 _req_counter = itertools.count(1)
 mcp = FastMCP("vkteams")
 
@@ -61,6 +83,7 @@ def _headers() -> dict:
 
 
 def _check_env() -> None:
+    _load_session()
     if not AIMSID or not SN:
         raise ToolError("Не заданы VKTEAMS_AIMSID и/или VKTEAMS_SN")
 
@@ -137,58 +160,143 @@ async def send_message(target: str, text: str) -> dict:
     return await _rapi("message/send", params)
 
 
-async def _fetch_events(timeout_ms: int = 1) -> list[dict]:
+async def _fetch_events(timeout_ms: int = 1, max_rounds: int = 8) -> list[dict]:
+    """Первый fetchEvents (first=1) + дочитывание по fetchBaseURL, пока идут события."""
     _check_env()
     if not FETCH_URL:
         raise ToolError("Не задан VKTEAMS_FETCH_URL (URL запроса fetchEvents из DevTools, без query)")
-    params = {"aimsid": AIMSID, "first": 1, "timeout": timeout_ms, "rnd": f"{time.time():.6f}"}
     h = {k: v for k, v in _headers().items() if k != "content-type"}
+    events: list[dict] = []
+    url, params = FETCH_URL, {"aimsid": AIMSID, "first": 1, "timeout": timeout_ms}
+    alt = os.environ.get("VKTEAMS_FETCH_URL_FALLBACK", "")
+    tried_alt = False
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(FETCH_URL, params=params, headers=h)
-    if r.status_code != 200:
-        raise ToolError(f"fetchEvents: HTTP {r.status_code}: {r.text[:300]}")
-    data = r.json()
-    resp = data.get("response", data)
-    if resp.get("statusCode") not in (None, 200):
-        raise ToolError(f"fetchEvents: {resp.get('statusCode')} {resp.get('statusText')}")
-    return (resp.get("data") or {}).get("events") or []
+        for i in range(max_rounds):
+            params["rnd"] = f"{time.time():.6f}"
+            r = await c.get(url, params=params, headers=h)
+            if r.status_code != 200:
+                raise ToolError(f"fetchEvents: HTTP {r.status_code}: {r.text[:300]}")
+            data = r.json()
+            resp = data.get("response", data)
+            if resp.get("statusCode") == 460 and i == 0 and not tried_alt and alt and alt != url:
+                tried_alt, url = True, alt
+                continue
+            if resp.get("statusCode") not in (None, 200):
+                sc = resp.get('statusCode')
+                raise ToolError(f"fetchEvents: {sc} {resp.get('statusText')}" + (f". {EXPIRED_HINT}" if sc in (401, 460, 607) else ""))
+            d = resp.get("data") or {}
+            batch = d.get("events") or []
+            events.extend(batch)
+            nxt = d.get("fetchBaseURL")
+            if not nxt or (i > 0 and not batch):
+                break
+            url, params = nxt, {"timeout": 500 if i == 0 else timeout_ms}
+    return events
 
 
 @mcp.tool()
-async def list_chats(query: str = "", limit: int = 100) -> dict:
-    """Список чатов и контактов (из событий buddylist / histDlgState в fetchEvents).
-    query — фильтр по названию или sn (без учёта регистра)."""
-    events = await _fetch_events()
-    chats: dict[str, dict] = {}
+async def list_chats(query: str = "", limit: int = 30, unread_only: bool = False) -> dict:
+    """Групповые чаты: непрочитанные, время и превью последнего сообщения, сортировка по свежести.
+    Список чатов берётся из контакт-листа (fetchEvents), состояние — getHistory по 1 сообщению на чат.
+    unread_only — только чаты с непрочитанными. query — фильтр по названию/sn."""
+    import asyncio
+    events = await _fetch_events(max_rounds=1)
+    groups: dict[str, str] = {}
     for e in events:
-        t, d = e.get("type"), e.get("eventData") or {}
-        if t == "buddylist":
-            for g in d.get("groups", []):
-                for b in g.get("buddies", []):
-                    sn = b.get("aimId") or b.get("sn")
-                    if sn:
-                        chats.setdefault(sn, {}).update({
-                            "sn": sn, "name": b.get("friendly") or b.get("displayId") or sn,
-                            "group": g.get("name"),
-                            "type": "chat" if sn.endswith("@chat.agent") else "person"})
-        elif t == "histDlgState":
-            sn = d.get("sn")
-            if sn:
-                c = chats.setdefault(sn, {"sn": sn, "name": sn,
-                                          "type": "chat" if sn.endswith("@chat.agent") else "person"})
-                c["unread"] = d.get("unreadCnt")
-                pers = {p.get("sn"): p.get("friendly") for p in d.get("persons", [])}
-                if pers.get(sn):
-                    c["name"] = pers[sn]
-    if not chats:
-        from collections import Counter
-        return {"chats": [], "note": "в ответе нет buddylist/histDlgState",
-                "event_types": dict(Counter(e.get("type") for e in events))}
-    items = list(chats.values())
+        if e.get("type") != "buddylist":
+            continue
+        for g in (e.get("eventData") or {}).get("groups", []):
+            for b in g.get("buddies", []):
+                sn = b.get("aimId") or b.get("sn") or ""
+                if sn.endswith("@chat.agent"):
+                    groups[sn] = b.get("friendly") or b.get("displayId") or sn
     if query:
         q = query.lower()
-        items = [c for c in items if q in (c.get("name") or "").lower() or q in c["sn"].lower()]
-    return {"total": len(items), "chats": items[:limit]}
+        groups = {sn: nm for sn, nm in groups.items() if q in nm.lower() or q in sn.lower()}
+    sem = asyncio.Semaphore(6)
+
+    async def probe(sn: str, name: str) -> dict:
+        row = {"sn": sn, "name": name}
+        async with sem:
+            try:
+                res = await _rapi("getHistory", {"sn": sn, "fromMsgId": "-1", "count": -1, "lang": "ru",
+                                                 "mentions": {"resolve": False}, "patchVersion": "init"})
+            except Exception as ex:
+                row["error"] = str(ex)[:120]
+                row["_ts"] = 0
+                return row
+        row["unread"] = res.get("unreadCnt") or 0
+        msgs = _fmt_messages(res)
+        if msgs:
+            m = msgs[-1]
+            row.update({"last_time": m["time"], "last_from": m["sender"], "last_text": (m["text"] or "")[:200]})
+            row["_ts"] = max((x.get("time", 0) for x in res.get("messages", [])), default=0)
+        else:
+            row["_ts"] = 0
+        return row
+
+    rows = await asyncio.gather(*(probe(sn, nm) for sn, nm in groups.items()))
+    rows.sort(key=lambda r: r["_ts"], reverse=True)
+    for r in rows:
+        r.pop("_ts", None)
+    if unread_only:
+        rows = [r for r in rows if r.get("unread")]
+    return {"total": len(rows), "unread_chats": sum(1 for r in rows if r.get("unread")), "chats": rows[:limit]}
+
+@mcp.tool()
+async def wim_call(method: str, params: dict | None = None, base: str = "") -> dict:
+    """Служебный GET к WIM-слою под aimsid: {U_DOMAIN}/api/{ver}/wim/<method>.
+    base — переопределить префикс целиком (напр. полный URL fetchEvents). Только для диагностики."""
+    _check_env()
+    url = (base.rstrip("/") + "/" + method.lstrip("/")) if base else f"{U_DOMAIN}/api/{API_VER}/wim/{method.lstrip('/')}"
+    q = {"aimsid": AIMSID, "f": "json", "r": f"{next(_req_counter)}-{int(time.time())}"}
+    q.update(params or {})
+    h = {k: v for k, v in _headers().items() if k != "content-type"}
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(url, params=q, headers=h)
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text[:1500]
+    if isinstance(body, dict):
+        txt = __import__("json").dumps(body, ensure_ascii=False)
+        if len(txt) > 6000:
+            body = {"truncated": txt[:6000]}
+    return {"url": url, "http": r.status_code, "body": body}
+
+
+@mcp.tool()
+async def mark_read(chats: list[str] | None = None, all_groups: bool = False,
+                    exclude: list[str] | None = None) -> dict:
+    """Отметить прочитанными. chats — список sn; all_groups=True — все групповые чаты с непрочитанными.
+    exclude — sn или подстроки названий, которые не трогать. Личные чаты при all_groups не трогаются."""
+    import asyncio
+    targets: dict[str, str] = {sn: sn for sn in (chats or [])}
+    if all_groups:
+        res = await list_chats(limit=1000, unread_only=True)
+        for c in res["chats"]:
+            targets[c["sn"]] = c.get("name") or c["sn"]
+    ex = [x.lower() for x in (exclude or [])]
+    targets = {sn: nm for sn, nm in targets.items()
+               if not any(x == sn.lower() or x in nm.lower() for x in ex)}
+    sem = asyncio.Semaphore(6)
+
+    async def one(sn: str, nm: str) -> dict:
+        async with sem:
+            try:
+                h = await _rapi("getHistory", {"sn": sn, "fromMsgId": "-1", "count": -1, "lang": "ru",
+                                               "mentions": {"resolve": False}, "patchVersion": "init"})
+                last, unread = h.get("lastMsgId"), h.get("unreadCnt") or 0
+                if last and unread:
+                    await _rapi("setDlgState", {"sn": sn, "lastRead": str(last)})
+                return {"name": nm, "sn": sn, "was_unread": unread}
+            except Exception as e:
+                return {"name": nm, "sn": sn, "error": str(e)[:120]}
+
+    done = await asyncio.gather(*(one(sn, nm) for sn, nm in targets.items()))
+    return {"marked": sum(1 for d in done if d.get("was_unread")),
+            "total_unread_cleared": sum(d.get("was_unread") or 0 for d in done),
+            "chats": done}
 
 
 if __name__ == "__main__":

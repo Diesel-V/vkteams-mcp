@@ -12,7 +12,9 @@ MCP-сервер для [VK Teams](https://teams.vk.com), работающий *
 |---|---|
 | `get_history` | История чата или лички, с пагинацией и тредами; имена авторов подставляются из ответа |
 | `send_message` | Отправка сообщения в личку или групповой чат |
-| `list_chats` | Список чатов и контактов с фильтром по названию (нужен `VKTEAMS_FETCH_URL`) |
+| `list_chats` | Групповые чаты: непрочитанные, время и превью последнего сообщения, сортировка по свежести; `unread_only`, фильтр по названию (нужен `VKTEAMS_FETCH_URL`) |
+| `mark_read` | Отметить прочитанными выбранные чаты или все групповые с исключениями; личку не трогает |
+| `wim_call` | Произвольный метод `wim/*` |
 | `rapi_call` | Произвольный метод `rapi/*` — для всего, что ещё не обёрнуто |
 
 Проверено на облачном VK Teams (`myteam.mail.ru` / VK WorkSpace), API `v150`.
@@ -60,9 +62,14 @@ aimsid действует до перелогина. После выхода и�
 | `VKTEAMS_SN` | да | — |
 | `VKTEAMS_U_DOMAIN` | нет | `https://u.myteam.vmailru.net` |
 | `VKTEAMS_API_VER` | нет | `v150` |
+| `VKTEAMS_FETCH_URL_FALLBACK` | нет | запасной URL `fetchEvents`, если основной вернул 460 |
 | `VKTEAMS_FETCH_URL` | для `list_chats` | URL запроса `fetchEvents` из DevTools без query, вида `https://u.myteam.vmailru.net/api/v150/bos/<server>/aim/fetchEvents` |
 
 Для on-premise инсталляции подставь свой `VKTEAMS_U_DOMAIN` (виден в DevTools как хост rapi-запросов).
+
+## Обновление сессии без перезапуска
+
+Если рядом с `vkteams_mcp.py` лежит `vkteams_session.json` вида `{"aimsid": "...", "fetch_url": "..."}`, сервер перечитывает его при каждом вызове и берёт сессию оттуда (приоритет над env). Протухла сессия — достаточно обновить файл. Файл в `.gitignore`.
 
 ## Как устроен API
 
