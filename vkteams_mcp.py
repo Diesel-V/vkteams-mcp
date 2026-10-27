@@ -299,5 +299,90 @@ async def mark_read(chats: list[str] | None = None, all_groups: bool = False,
             "chats": done}
 
 
+FILES_GET_PREFIX = os.environ.get("VKTEAMS_FILES_GET", "https://files.myteam.mail.ru/get/")
+
+
+def _find_key(obj, keys):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in keys and isinstance(v, str) and v:
+                return v
+        for v in obj.values():
+            r = _find_key(v, keys)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_key(v, keys)
+            if r:
+                return r
+    return None
+
+
+async def _upload_file(target: str, filename: str, data: bytes) -> dict:
+    """files/init → POST на выданный upload-URL → fileid / ссылка files.../get/<id>."""
+    _check_env()
+    q = {"aimsid": AIMSID, "ts": str(int(time.time())), "size": str(len(data)),
+         "filename": filename, "client": "VKTeams", "target": target}
+    h = {k: v for k, v in _headers().items() if k != "content-type"}
+    async with httpx.AsyncClient(timeout=120) as c:
+        r = await c.get(f"{U_DOMAIN}/api/{API_VER}/files/init", params=q, headers=h)
+        try:
+            init = r.json()
+        except Exception:
+            raise ToolError(f"files/init: HTTP {r.status_code}: {r.text[:300]}")
+        res = init.get("result") or {}
+        if r.status_code != 200 or not res.get("host") or not res.get("url"):
+            raise ToolError(f"files/init: HTTP {r.status_code}: {str(init)[:300]}")
+        up_url = f"https://{res['host']}{res['url']}"
+        uh = dict(h)
+        uh.update({
+            "content-type": "application/octet-stream",
+            "content-disposition": f'attachment; filename="{filename}"',
+            "content-range": f"bytes 0-{len(data) - 1}/{len(data)}",
+            "x-requested-with": "XMLHttpRequest",
+        })
+        u = await c.post(up_url, params={"aimsid": AIMSID}, content=data, headers=uh)
+    try:
+        up = u.json()
+    except Exception:
+        raise ToolError(f"files/upload: HTTP {u.status_code}: {u.text[:300]}")
+    if u.status_code != 200:
+        raise ToolError(f"files/upload: HTTP {u.status_code}: {str(up)[:300]}")
+    link = _find_key(up, {"static_url", "staticUrl"})
+    fid = _find_key(up, {"fileid", "fileId", "file_id"})
+    if not link and fid:
+        link = FILES_GET_PREFIX + fid
+    if not link:
+        raise ToolError(f"files/upload: в ответе нет fileid: {str(up)[:300]}")
+    return {"fileid": fid, "url": link}
+
+
+@mcp.tool()
+async def send_file(target: str, filename: str, content_b64: str = "", path: str = "",
+                    caption: str = "") -> dict:
+    """Отправить файл. target: логин (x@company.ru) или '…@chat.agent'.
+    Содержимое: content_b64 (base64) или path (локальный путь). caption — подпись отдельным сообщением.
+    Отправляет от имени владельца аккаунта — вызывать только по явной просьбе пользователя."""
+    import base64
+    if content_b64:
+        data = base64.b64decode(content_b64)
+    elif path:
+        with open(os.path.expanduser(path), "rb") as f:
+            data = f.read()
+    else:
+        raise ToolError("Нужен content_b64 или path")
+    if not data:
+        raise ToolError("Пустой файл")
+    up = await _upload_file(target, filename, data)
+    sent = await _rapi("message/send", {"target": target,
+                                        "parts": {"mainPart": {"text": {"plain": up["url"]}}}})
+    out = {"file_url": up["url"], "fileid": up["fileid"], "sent": sent}
+    if caption:
+        out["caption"] = await _rapi("message/send", {"target": target,
+                                                      "parts": {"mainPart": {"text": {"plain": caption}}}})
+    return out
+
+
 if __name__ == "__main__":
     mcp.run()
